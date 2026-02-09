@@ -80,6 +80,24 @@ get_chanel_from(struct coro_bus* bus, int channel) {
     return bus->channels[channel];
 }
 
+static void
+send_and_wakeup_to(struct coro_bus_channel* chan, unsigned data) {
+    chan->messages.push(data);
+    wakeup_first_and_remove_from(chan->recv_queue);
+}
+
+static void
+read_and_wakeup_from(
+        struct coro_bus* bus,
+        struct coro_bus_channel* chan,
+        unsigned* data) {
+    *data = chan->messages.front();
+    chan->messages.pop();
+    if (wakeup_first_and_remove_from(chan->send_queue)) {
+        wakeup_first_and_remove_from(bus->broadcast_queue);
+    }
+}
+
 struct coro_bus *
 coro_bus_new(void)
 {
@@ -216,8 +234,7 @@ coro_bus_try_send(struct coro_bus *bus, int channel, unsigned data)
         return -1;
     }
 
-    chan->messages.push(data);
-    wakeup_first_and_remove_from(chan->recv_queue);
+    send_and_wakeup_to(chan, data);
     return 0;
 
 	/*
@@ -265,11 +282,7 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
         return -1;
     }
 
-    *data = chan->messages.front();
-    chan->messages.pop();
-    if (wakeup_first_and_remove_from(chan->send_queue)) {
-        wakeup_first_and_remove_from(bus->broadcast_queue);
-    }
+    read_and_wakeup_from(bus, chan, data);
     return 0;
 }
 
@@ -318,8 +331,7 @@ coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
     }
 
     for (auto& chan : alive_chans) {
-        chan->messages.push(data);
-        wakeup_first_and_remove_from(chan->recv_queue);
+        send_and_wakeup_to(chan, data);
     }
 
     return 0;
@@ -332,49 +344,89 @@ coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 int
 coro_bus_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigned count)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)channel;
-	(void)data;
-	(void)count;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    for (;;) {
+        int writes;
+        if ((writes = coro_bus_try_send_v(bus, channel, data, count)) > 0) {
+            return writes;
+        }
+
+        enum coro_bus_error_code err = coro_bus_errno();
+        if (err == CORO_BUS_ERR_NO_CHANNEL) {
+            return -1;
+        } else if (err == CORO_BUS_ERR_WOULD_BLOCK) {
+            struct coro_bus_channel* chan = get_chanel_from(bus, channel);
+            suspend_this_and_save_to(chan->send_queue);
+        } else {
+            coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
+            return -1;
+        }
+    }
 }
 
 int
 coro_bus_try_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigned count)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)channel;
-	(void)data;
-	(void)count;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    struct coro_bus_channel* chan = get_chanel_from(bus, channel);
+    if (chan == NULL) {
+        coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
+        return -1;
+    }
+
+    size_t i = 0;
+    while (have_free_space(chan) && i < count) {
+        send_and_wakeup_to(chan, data[i++]);
+    }
+
+    if (i == 0) {
+        coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
+        return -1;
+    }
+
+    return i;
 }
 
 int
 coro_bus_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capacity)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)channel;
-	(void)data;
-	(void)capacity;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    for (;;) {
+        int reads;
+        if ((reads = coro_bus_try_recv_v(bus, channel, data, capacity)) > 0) {
+            return reads;
+        }
+
+        enum coro_bus_error_code err = coro_bus_errno();
+        if (err == CORO_BUS_ERR_NO_CHANNEL) {
+            return -1;
+        } else if (err == CORO_BUS_ERR_WOULD_BLOCK) {
+            struct coro_bus_channel* chan = get_chanel_from(bus, channel);
+            suspend_this_and_save_to(chan->recv_queue);
+        } else {
+            coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
+            return -1;
+        }
+    }
 }
 
 int
 coro_bus_try_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capacity)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)channel;
-	(void)data;
-	(void)capacity;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    struct coro_bus_channel* chan = get_chanel_from(bus, channel);
+    if (chan == NULL) {
+        coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
+        return -1;
+    }
+
+    size_t i = 0;
+    while (!chan->messages.empty() && i < capacity) {
+        read_and_wakeup_from(bus, chan, &data[i++]);
+    }
+
+    if (i == 0) {
+        coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
+        return -1;
+    }
+
+    return i;
 }
 
 #endif
