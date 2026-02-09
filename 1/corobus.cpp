@@ -21,6 +21,7 @@ struct coro_bus_channel {
 
 struct coro_bus {
 	std::vector<struct coro_bus_channel*> channels;
+	std::queue<struct coro*> broadcast_queue;
 };
 
 static enum coro_bus_error_code global_error = CORO_BUS_ERR_NONE;
@@ -51,13 +52,21 @@ suspend_this_and_save_to(std::queue<struct coro*>& coro_queue) {
     coro_suspend();
 }
 
-static void
+static int
 wakeup_first_and_remove_from(std::queue<struct coro*>& coro_queue) {
+    //! Returns 0 if some coroutine was woken up else 1
     if (!coro_queue.empty()) {
         struct coro* waiting_coro = coro_queue.front();
         coro_queue.pop();
         coro_wakeup(waiting_coro);
+        return 0;
     }
+    return 1;
+}
+
+static bool
+have_free_space(struct coro_bus_channel* chan) {
+    return chan->messages.size() < chan->size_limit;
 }
 
 static struct coro_bus_channel*
@@ -132,8 +141,8 @@ coro_bus_channel_close(struct coro_bus *bus, int channel)
 
     wakeup_coro_queue(chan->send_queue);
     wakeup_coro_queue(chan->recv_queue);
-    delete chan;
     bus->channels[channel] = NULL;
+    delete chan;
     coro_yield();
 
 	/*
@@ -202,7 +211,7 @@ coro_bus_try_send(struct coro_bus *bus, int channel, unsigned data)
         return -1;
     }
 
-    if (chan->messages.size() >= chan->size_limit) {
+    if (!have_free_space(chan)) {
         coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
         return -1;
     }
@@ -258,7 +267,9 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 
     *data = chan->messages.front();
     chan->messages.pop();
-    wakeup_first_and_remove_from(chan->send_queue);
+    if (wakeup_first_and_remove_from(chan->send_queue)) {
+        wakeup_first_and_remove_from(bus->broadcast_queue);
+    }
     return 0;
 }
 
@@ -268,21 +279,50 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 int
 coro_bus_broadcast(struct coro_bus *bus, unsigned data)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)data;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    for (;;) {
+        if (coro_bus_try_broadcast(bus, data) == 0) {
+            break;
+        }
+
+        enum coro_bus_error_code err = coro_bus_errno();
+        if (err == CORO_BUS_ERR_NO_CHANNEL) {
+            return -1;
+        } else if (err == CORO_BUS_ERR_WOULD_BLOCK) {
+            suspend_this_and_save_to(bus->broadcast_queue);
+        } else {
+            coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 int
 coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)bus;
-	(void)data;
-	coro_bus_errno_set(CORO_BUS_ERR_NOT_IMPLEMENTED);
-	return -1;
+    std::vector<struct coro_bus_channel*> alive_chans;
+    for (auto& chan : bus->channels) {
+        if (chan != NULL) {
+            if (!have_free_space(chan)) {
+                coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
+                return -1;
+            }
+            alive_chans.push_back(chan);
+        }
+    }
+
+    if (alive_chans.empty()) {
+        coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
+        return -1;
+    }
+
+    for (auto& chan : alive_chans) {
+        chan->messages.push(data);
+        wakeup_first_and_remove_from(chan->recv_queue);
+    }
+
+    return 0;
 }
 
 #endif
